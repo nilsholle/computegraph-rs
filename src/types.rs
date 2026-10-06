@@ -1,5 +1,6 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::traits::GraphOperation;
@@ -40,11 +41,20 @@ pub enum ValueKey<Op: GraphOperation> {
 /// `OperationKey` caches a structural fingerprint so maps keyed by recursively
 /// derived values can avoid repeatedly re-hashing the whole input tree. Equality
 /// still checks the full structure after the fingerprint prefilter.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct OperationKey<Op: GraphOperation> {
     operation: Op,
     inputs: Vec<ValueKey<Op>>,
     role: OperationRole,
+    /// Equivalence class of this key: two keys carrying the same class id are
+    /// structurally equal.
+    ///
+    /// A fresh key gets a unique id; a clone inherits it; a structural
+    /// comparison that succeeds gives both sides the smaller of the two ids.
+    /// Without it, comparing two separately built keys of a shared expression
+    /// walks the DAG as a tree (every shared subexpression once per use),
+    /// which is exponential in the depth of the sharing.
+    class: AtomicU64,
     /// Cached hash prefilter for recursively structural keys.
     ///
     /// This is not an identity proof: equality still compares the full
@@ -89,6 +99,7 @@ impl<Op: GraphOperation> OperationKey<Op> {
             operation,
             inputs,
             role,
+            class: AtomicU64::new(NEXT_CLASS.fetch_add(1, Ordering::Relaxed)),
             fingerprint,
         }
     }
@@ -157,12 +168,42 @@ impl<Op: GraphOperation> Hash for ValueKey<Op> {
     }
 }
 
+/// Source of fresh equivalence-class ids (never reused).
+static NEXT_CLASS: AtomicU64 = AtomicU64::new(0);
+
+impl<Op: GraphOperation> Clone for OperationKey<Op> {
+    fn clone(&self) -> Self {
+        Self {
+            operation: self.operation.clone(),
+            inputs: self.inputs.clone(),
+            role: self.role.clone(),
+            class: AtomicU64::new(self.class.load(Ordering::Relaxed)),
+            fingerprint: self.fingerprint,
+        }
+    }
+}
+
 impl<Op: GraphOperation> PartialEq for OperationKey<Op> {
     fn eq(&self, other: &Self) -> bool {
-        self.fingerprint == other.fingerprint
-            && self.operation == other.operation
+        if self.fingerprint != other.fingerprint {
+            return false;
+        }
+        let lhs_class = self.class.load(Ordering::Relaxed);
+        let rhs_class = other.class.load(Ordering::Relaxed);
+        if lhs_class == rhs_class {
+            return true;
+        }
+        let equal = self.operation == other.operation
             && self.role == other.role
-            && self.inputs == other.inputs
+            && self.inputs == other.inputs;
+        if equal {
+            // Every id a key ever carries belongs to a key proven equal to it,
+            // so a racing store can only replace one valid id by another.
+            let class = lhs_class.min(rhs_class);
+            self.class.store(class, Ordering::Relaxed);
+            other.class.store(class, Ordering::Relaxed);
+        }
+        equal
     }
 }
 
